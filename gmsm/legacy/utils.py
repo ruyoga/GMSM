@@ -25,7 +25,6 @@ def msm_A(b, gamma_kbar, kbar):
                 [1 - gamma_k[i] + 0.5 * gamma_k[i], 0.5 * gamma_k[i]],
                 [0.5 * gamma_k[i], 1 - gamma_k[i] + 0.5 * gamma_k[i]]
             ])
-            # Kronecker product
             A = np.kron(A, a)
 
     return A

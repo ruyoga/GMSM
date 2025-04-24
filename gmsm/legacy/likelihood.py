@@ -73,8 +73,8 @@ def msm_ll(pimat0, omegat, A):
 def msm_smooth(A, P):
     """
     function to smoothen transition matrix
-    :param A: transition matrix (k x k) matrix
     :param P: filtered probs (T x k) matrix
+    :param A: transition matrix (k x k) matrix
     :return:
     """
     T = P.shape[0]

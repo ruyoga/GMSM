@@ -4,7 +4,7 @@ from scipy import stats
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from gmsm.likelihood import msm_likelihood, msm_ll, msm_smooth
+from gmsm.legacy.likelihood import msm_likelihood, msm_ll, msm_smooth
 from gmsm.utils import msm_A, msm_clustermat, msm_states, msm_mat_power, msm_marginals
 
 def msm_likelihood2(para, kbar, dat, n_vol):
