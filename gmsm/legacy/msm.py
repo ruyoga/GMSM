@@ -8,7 +8,7 @@ from gmsm.model import (
     msm_likelihood2, msm_ll2, msm_predict, msm_parameter_check,
     msm_std_err
 )
-from gmsm.likelihood import msm_smooth
+from gmsm.legacy.likelihood import msm_smooth
 from gmsm.utils import msm_clustermat, msm_marginals
 
 class MSM:
