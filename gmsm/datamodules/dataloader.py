@@ -3,19 +3,6 @@ import numpy as np
 
 
 class UnivariateDataloader:
-    """
-    Simple univariate data loader for price series.
-    - Expects a DataFrame with an index (timestamps) and a 'trade_price' column.
-    - Renames index to 'Date' and converts to datetime.
-    - Sorts by 'Date'.
-    - Calculates:
-        • raw returns
-        • log returns
-        • squared returns
-    - Drops the first row of NaNs.
-    - Provides methods to retrieve the processed DataFrame and return arrays.
-    """
-
     def __init__(self, df: pd.DataFrame, price_col: str = 'trade_price'):
         # Copy input to avoid modifying the original
         df = df.copy()
