@@ -348,12 +348,8 @@ class MSM:
             sigma_unann = 1e-6  # Ensure positive sigma
             warnings.warn("Sigma <= 0 encountered in density calculation. Setting to small positive.", RuntimeWarning)
 
-        # Calculate state-dependent standard deviations
         state_sigmas = sigma_unann * g_m  # Shape (1, k_states)
 
-        # Tile sigmas and returns for vectorized calculation
-        # sig_mat: Tile state_sigmas T times vertically -> (T, k_states)
-        # ret_mat: Tile returns k_states times horizontally -> (T, k_states)
         T = self.ret.shape[0]
         sig_mat = np.tile(state_sigmas, (T, 1))
         ret_mat = np.tile(self.ret, (1, self.k_states))
@@ -916,14 +912,13 @@ class MSM:
             return None
 
         m0 = self.parameters[0]
-        Mmat = self.results["component_matrix"]  # k_states x kbar
+        Mmat = self.results["component_matrix"]
 
         if use_smoothed:
-            P = self.results["smoothed_probabilities"]  # T x k_states
+            P = self.results["smoothed_probabilities"]
         else:
-            P = self.results["filtered_probabilities"]  # T x k_states
+            P = self.results["filtered_probabilities"]
 
-        # Calculate marginal probabilities P(M_k = m0 | data) -> shape (T, kbar)
         p_m0_marginals = self._calculate_marginal_probabilities(P, m0, Mmat)
 
         m1 = 2.0 - m0
