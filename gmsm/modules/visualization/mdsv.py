@@ -1,11 +1,10 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Union, List, Optional
-from scipy import stats
+from typing import Union, List
 from statsmodels.nonparametric.smoothers_lowess import lowess
 
-from gmsm.modules.models.mdsv import MDSVFit, MDSVFilter, MDSVRoll, MDSVSim
+from gmsm.models import MDSVFit, MDSVFilter, MDSVRoll, MDSVSim
 from .core import MDSVProcess
 
 
