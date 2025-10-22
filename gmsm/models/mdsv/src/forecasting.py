@@ -1,5 +1,5 @@
 """
-MDSV Forecasting Module
+MDSV Forecasting Module - CORRECTED to match Augustyniak et al. (2024) Equation 22
 Provides forecasting functionality for MDSV models
 """
 
@@ -13,8 +13,8 @@ class MDSVForecaster:
     """
     Forecasting for MDSV models
 
-    This class handles multi-step ahead forecasting for fitted MDSV models,
-    including bootstrap methods for models with leverage effects.
+    CRITICAL FIX: Implements Equation 22 from Augustyniak et al. (2024) correctly
+    with leverage effect L_t+1^φ multiplier
     """
 
     def __init__(self, model):
@@ -31,16 +31,17 @@ class MDSVForecaster:
 
         self.model = model
         self.params = model._param_dict_to_array(model.params_)
-        self.sigma = model._compute_volatility_vector(self.params)
+        self.sigma = model._compute_volatility_vector(self.params)  # Base volatility states (V_t, not V_t^(L))
         self.P = model._compute_transition_matrix(self.params)
 
     def forecast(self, n_ahead: int,
                  last_obs: Optional[np.ndarray] = None,
                  filtered_probs: Optional[np.ndarray] = None,
                  n_simulations: int = 10000,
-                 return_simulations: bool = False) -> Dict:
+                 return_simulations: bool = False,
+                 return_history: Optional[np.ndarray] = None) -> Dict:
         """
-        Generate forecasts for n_ahead periods
+        Generate forecasts for n_ahead periods using CORRECT Equation 22
 
         Parameters
         ----------
@@ -51,97 +52,123 @@ class MDSVForecaster:
         filtered_probs : np.ndarray, optional
             Filtered probability distribution at last time point
         n_simulations : int
-            Number of simulations for bootstrap forecasting (if leverage)
+            Number of simulations for bootstrap forecasting (multi-step)
         return_simulations : bool
             Whether to return full simulation paths
+        return_history : np.ndarray, optional
+            Historical returns for computing leverage effect (at least 70 lags)
 
         Returns
         -------
         dict
-            Dictionary containing forecast results:
-            - 'volatility': Expected volatility forecast
-            - 'returns_var': Forecast variance of returns (if applicable)
-            - 'rv': Forecast realized variance (if applicable)
-            - 'quantiles': Forecast quantiles
-            - 'simulations': Full simulation paths (if requested)
+            Dictionary containing forecast results
         """
-
         # Get initial state distribution
         if filtered_probs is None:
             filtered_probs = self.model._compute_stationary_dist(self.params)
 
-        results = {}
+        # For models with leverage, we need return history
+        if self.model.leverage and return_history is None:
+            warnings.warn("Leverage model requires return_history for accurate forecasts. "
+                         "Using L_t = 1.0 (no leverage effect)")
 
-        if self.model.leverage:
-            # Use bootstrap for models with leverage
-            results = self._forecast_bootstrap(
-                n_ahead, filtered_probs, last_obs, n_simulations, return_simulations
+        # Use analytical formula for one-step forecast (Equation 22)
+        if n_ahead == 1:
+            results = self._forecast_one_step_analytical(
+                filtered_probs, return_history
             )
         else:
-            # Analytical forecasting for models without leverage
-            results = self._forecast_analytical(n_ahead, filtered_probs)
+            # Multi-step: use simulations
+            results = self._forecast_bootstrap(
+                n_ahead, filtered_probs, last_obs, n_simulations,
+                return_simulations, return_history
+            )
 
         return results
 
-    def _forecast_analytical(self, n_ahead: int,
-                             initial_probs: np.ndarray) -> Dict:
+    def _forecast_one_step_analytical(self, filtered_probs: np.ndarray,
+                                     return_history: Optional[np.ndarray] = None) -> Dict:
         """
-        Analytical forecasting for models without leverage effect
+        CRITICAL FIX: Implement Equation 22 from Augustyniak et al. (2024) EXACTLY
 
-        Uses the Markov chain structure to compute exact forecast distributions
+        Equation 22:
+        RV^_t+1 = L_{t+1}^φ * exp(ξ + δ₁²/(2(1-2δ₂)) - δ₂ + γ²/2) / sqrt(1-2δ₂)
+                  * Σⱼ p(V_{t+1} = υⱼ | Y₁:ₜ) * υⱼ^φ
         """
-        forecasts = {
-            'volatility': np.zeros(n_ahead),
-            'state_probs': np.zeros((n_ahead, self.model.n_states))
-        }
+        results = {}
 
-        # Propagate state probabilities forward
-        current_probs = initial_probs.copy()
-        for h in range(n_ahead):
-            # Predict next state distribution
-            current_probs = self.P.T @ current_probs
-            forecasts['state_probs'][h, :] = current_probs
+        # Propagate state probabilities one step ahead
+        next_probs = self.P.T @ filtered_probs
 
-            # Expected volatility
-            forecasts['volatility'][h] = np.sum(current_probs * self.sigma)
-
-        # Add model-specific forecasts
         if self.model.model_type == 0:
-            # Returns model - forecast variance
-            forecasts['returns_var'] = forecasts['volatility']
+            # Returns only model
+            expected_vol = np.sum(next_probs * self.sigma)
+            results['volatility'] = expected_vol
+            results['returns_var'] = expected_vol
 
         elif self.model.model_type == 1:
-            # RV model
+            # RV only model
             shape = self.params[5]
-            forecasts['rv'] = forecasts['volatility'] * np.exp(shape / 2)
+            expected_vol = np.sum(next_probs * self.sigma)
+            results['volatility'] = expected_vol
+
+            # For RV-only, no leverage, simpler formula
+            results['rv'] = expected_vol * np.exp(shape / 2)
 
         elif self.model.model_type == 2:
-            # Joint model
+            # Joint model - USE EQUATION 22 EXACTLY
             xi = self.params[5]
             varphi = self.params[6]
+            delta1 = self.params[7]
             delta2 = self.params[8]
-            shape = self.params[9]
+            shape = self.params[9]  # gamma in paper
 
-            # Expected RV (approximation)
-            forecasts['returns_var'] = forecasts['volatility']
-            forecasts['rv'] = np.zeros(n_ahead)
+            # Get leverage parameters
+            if self.model.leverage:
+                l1 = self.params[10]
+                theta_l = self.params[11]
 
-            for h in range(n_ahead):
-                expected_log_v = np.sum(current_probs * np.log(self.sigma))
-                forecasts['rv'][h] = np.exp(xi + varphi * expected_log_v +
-                                            shape / 2 - delta2) / np.sqrt(1 - 2 * delta2)
+                # Compute L_{t+1} from return history
+                if return_history is not None and len(return_history) > 0:
+                    L_t_plus_1 = self._compute_leverage_forward(
+                        return_history, l1, theta_l
+                    )
+                else:
+                    L_t_plus_1 = 1.0
+                    warnings.warn("No return history provided, using L_t+1 = 1.0")
+            else:
+                L_t_plus_1 = 1.0
 
-        return forecasts
+            # CRITICAL: Compute Σⱼ p_j * υⱼ^φ (NOT exp(φ * E[log(V)]))
+            sum_prob_vol_phi = np.sum(next_probs * np.power(self.sigma, varphi))
+
+            # Compute constant term from Equation 22
+            const_term = np.exp(
+                xi +
+                delta1**2 / (2 * (1 - 2*delta2)) -
+                delta2 +
+                shape**2 / 2
+            ) / np.sqrt(1 - 2*delta2)
+
+            # EQUATION 22: Complete formula
+            rv_forecast = (L_t_plus_1 ** varphi) * const_term * sum_prob_vol_phi
+
+            results['rv'] = rv_forecast
+            results['volatility'] = np.sum(next_probs * self.sigma)
+            results['returns_var'] = results['volatility'] * L_t_plus_1
+            results['leverage_multiplier'] = L_t_plus_1
+            results['state_probs'] = next_probs
+
+        return results
 
     def _forecast_bootstrap(self, n_ahead: int,
-                            initial_probs: np.ndarray,
-                            last_obs: Optional[np.ndarray],
-                            n_simulations: int,
-                            return_simulations: bool) -> Dict:
+                           initial_probs: np.ndarray,
+                           last_obs: Optional[np.ndarray],
+                           n_simulations: int,
+                           return_simulations: bool,
+                           return_history: Optional[np.ndarray]) -> Dict:
         """
-        Bootstrap forecasting for models with leverage effect
-
-        Simulates future paths accounting for leverage dynamics
+        Bootstrap forecasting for multi-step forecasts with leverage effect
         """
         # Initialize storage
         if self.model.model_type in [0, 2]:
@@ -150,51 +177,55 @@ class MDSVForecaster:
             rv_sim = np.zeros((n_simulations, n_ahead))
 
         volatility_sim = np.zeros((n_simulations, n_ahead))
+        leverage_sim = np.zeros((n_simulations, n_ahead))
 
         # Get leverage parameters
         if self.model.leverage:
-            j = 0
             if self.model.model_type == 1:
-                j = 1
+                l1 = self.params[6]
+                theta_l = self.params[7]
             elif self.model.model_type == 2:
-                j = 5
-            l1 = self.params[5 + j]
-            theta_l = self.params[6 + j]
-
-            # Initialize leverage history
-            n_lags = 70  # As in the R code
-            if last_obs is not None and len(last_obs) >= n_lags:
-                leverage_history = self._compute_leverage(last_obs[-n_lags:], l1, theta_l)
+                l1 = self.params[10]
+                theta_l = self.params[11]
             else:
-                leverage_history = np.ones(n_lags)
+                l1 = self.params[5]
+                theta_l = self.params[6]
 
         # Simulate paths
         for sim in range(n_simulations):
             # Sample initial state
             state = np.random.choice(self.model.n_states, p=initial_probs)
 
-            # Storage for this simulation
-            returns_path = []
+            # Initialize return history for leverage
+            if self.model.leverage and return_history is not None:
+                returns_history = list(return_history[-70:])  # Keep last 70
+            else:
+                returns_history = []
 
             for h in range(n_ahead):
-                # Get current volatility
+                # Get current base volatility (without leverage)
                 vol = self.sigma[state]
 
-                # Apply leverage if applicable
-                if self.model.leverage and h > 0:
-                    # Update leverage based on past returns
-                    if len(returns_path) > 0:
-                        recent_returns = np.array(returns_path[-min(n_lags, len(returns_path)):])
-                        leverage = self._compute_leverage_scalar(recent_returns, l1, theta_l)
-                        vol *= leverage
+                # Compute leverage multiplier from history
+                if self.model.leverage and len(returns_history) > 0:
+                    L_t = self._compute_leverage_forward(
+                        np.array(returns_history), l1, theta_l
+                    )
+                else:
+                    L_t = 1.0
 
-                volatility_sim[sim, h] = vol
+                # Apply leverage to get V^(L)_t = V_t * L_t
+                vol_leveraged = vol * L_t
+                leverage_sim[sim, h] = L_t
+                volatility_sim[sim, h] = vol_leveraged
 
-                # Generate returns
+                # Generate returns if needed
                 if self.model.model_type in [0, 2]:
-                    r = np.random.normal(0, np.sqrt(vol))
+                    r = np.random.normal(0, np.sqrt(vol_leveraged))
                     returns_sim[sim, h] = r
-                    returns_path.append(r)
+                    returns_history.append(r)
+                    if len(returns_history) > 70:
+                        returns_history.pop(0)
 
                 # Generate RV
                 if self.model.model_type == 1:
@@ -208,8 +239,13 @@ class MDSVForecaster:
                     delta2 = self.params[8]
                     shape = self.params[9]
 
-                    epsilon = r / np.sqrt(vol)
-                    mu_rv = xi + varphi * np.log(vol) + delta1 * epsilon + delta2 * (epsilon ** 2 - 1)
+                    if self.model.model_type in [0, 2]:
+                        epsilon = r / np.sqrt(vol_leveraged)
+                    else:
+                        epsilon = 0
+
+                    # Use leveraged volatility in log(RV) equation
+                    mu_rv = xi + varphi * np.log(vol_leveraged) + delta1 * epsilon + delta2 * (epsilon ** 2 - 1)
                     rv_sim[sim, h] = np.random.lognormal(mu_rv, np.sqrt(shape))
 
                 # Transition to next state
@@ -219,7 +255,8 @@ class MDSVForecaster:
         # Compute summary statistics
         results = {
             'volatility': np.mean(volatility_sim, axis=0),
-            'volatility_std': np.std(volatility_sim, axis=0)
+            'volatility_std': np.std(volatility_sim, axis=0),
+            'leverage_multiplier': np.mean(leverage_sim, axis=0)
         }
 
         if self.model.model_type in [0, 2]:
@@ -233,7 +270,8 @@ class MDSVForecaster:
 
         if return_simulations:
             results['simulations'] = {
-                'volatility': volatility_sim
+                'volatility': volatility_sim,
+                'leverage': leverage_sim
             }
             if self.model.model_type in [0, 2]:
                 results['simulations']['returns'] = returns_sim
@@ -242,55 +280,49 @@ class MDSVForecaster:
 
         return results
 
-    def _compute_leverage(self, returns: np.ndarray, l1: float, theta_l: float) -> np.ndarray:
+    def _compute_leverage_forward(self, returns: np.ndarray,
+                                  l1: float, theta_l: float,
+                                  n_lags: int = 70) -> float:
         """
-        Compute leverage effect based on past returns
+        Compute forward leverage multiplier L_{t+1} from past returns
 
-        Parameters
-        ----------
-        returns : np.ndarray
-            Past returns
-        l1 : float
-            Leverage intensity parameter
-        theta_l : float
-            Leverage decay parameter
+        CORRECT implementation of Equation 19:
+        L_t = ∏ᵢ₌₁^NL [1 + lᵢ * |r_{t-i}| / √(L_{t-i})] * 1{r_{t-i} < 0}
+        where lᵢ = θₗ^(i-1) * l₁
 
-        Returns
-        -------
-        np.ndarray
-            Leverage multipliers
+        For forecasting t+1, we use returns up to time t
         """
+        if len(returns) == 0:
+            return 1.0
+
         n = len(returns)
-        leverage = np.ones(n)
+        max_lags = min(n, n_lags)
 
-        for t in range(1, n):
-            lev_t = 1.0
-            for i in range(min(t, 70)):  # Max 70 lags as in R code
-                li = l1 * (theta_l ** i)
-                if returns[t - i - 1] < 0:
-                    lev_t *= (1 + li * abs(returns[t - i - 1]) / np.sqrt(leverage[t - i - 1]))
-            leverage[t] = lev_t
+        # We need to compute L values iteratively for accuracy
+        L_history = np.ones(n + 1)  # L_0, L_1, ..., L_n
 
-        return leverage
+        for t in range(1, n + 1):
+            L_t = 1.0
+            for i in range(1, min(t, n_lags) + 1):
+                if returns[t - i] < 0:
+                    li = l1 * (theta_l ** (i - 1))
+                    L_t *= (1.0 + li * abs(returns[t - i]) / np.sqrt(L_history[t - i]))
+            L_history[t] = L_t
+
+        # Return the last computed leverage (which is L_t, used for forecasting t+1)
+        return L_history[-1]
 
     def _compute_leverage_scalar(self, recent_returns: np.ndarray,
                                  l1: float, theta_l: float) -> float:
         """
-        Compute single leverage value based on recent returns
+        Simplified leverage computation for recent returns only
         """
-        leverage = 1.0
-        n = len(recent_returns)
-
-        for i in range(min(n, 70)):
-            if i < n and recent_returns[-(i + 1)] < 0:
-                li = l1 * (theta_l ** i)
-                leverage *= (1 + li * abs(recent_returns[-(i + 1)]))
-
-        return leverage
+        return self._compute_leverage_forward(recent_returns, l1, theta_l)
 
     def compute_value_at_risk(self, n_ahead: int = 1,
                               alpha: float = 0.05,
-                              n_simulations: int = 10000) -> np.ndarray:
+                              n_simulations: int = 10000,
+                              return_history: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Compute Value at Risk for returns
 
@@ -302,6 +334,8 @@ class MDSVForecaster:
             VaR level (e.g., 0.05 for 95% VaR)
         n_simulations : int
             Number of simulations
+        return_history : np.ndarray, optional
+            Historical returns for leverage computation
 
         Returns
         -------
@@ -312,14 +346,18 @@ class MDSVForecaster:
             raise ValueError("VaR only available for models with returns")
 
         # Get forecast with simulations
-        forecast = self.forecast(n_ahead, n_simulations=n_simulations,
-                                 return_simulations=True)
+        forecast = self.forecast(
+            n_ahead,
+            n_simulations=n_simulations,
+            return_simulations=True,
+            return_history=return_history
+        )
 
         if 'simulations' in forecast and 'returns' in forecast['simulations']:
             returns_sim = forecast['simulations']['returns']
             var = np.percentile(returns_sim, alpha * 100, axis=0)
         else:
-            # Analytical approximation using normal distribution
+            # Analytical approximation
             volatility = forecast['volatility']
             var = norm.ppf(alpha) * np.sqrt(volatility)
 
