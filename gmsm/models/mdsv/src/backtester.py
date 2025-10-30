@@ -31,6 +31,7 @@ class OptionsBacktesterPolars:
         predictions_df : Polars DataFrame with MDSV predictions
         options_df : Polars DataFrame with options data
         threshold : Signal threshold - trades when predicted_vol > market_iv + threshold
+                    Can be negative to trade when predicted < market (underpriced vol)
         """
         self.initial_capital = initial_capital
         self.strategy_type = strategy_type
@@ -173,7 +174,6 @@ class OptionsBacktesterPolars:
 
     def _black_scholes_price(self, S: float, K: float, T: float, r: float,
                              sigma: float, option_type: str) -> float:
-        """Calculate Black-Scholes option price"""
         if T <= 0:
             if option_type.lower() == 'c':
                 return max(S - K, 0)
@@ -193,7 +193,6 @@ class OptionsBacktesterPolars:
     def _implied_volatility_vectorized(self, prices: np.ndarray, S: float,
                                        strikes: np.ndarray, T: float, r: float,
                                        option_types: np.ndarray) -> np.ndarray:
-        """Vectorized IV calculation for better performance"""
         ivs = np.full_like(prices, np.nan)
 
         for i in range(len(prices)):
@@ -222,8 +221,18 @@ class OptionsBacktesterPolars:
         return ivs
 
     def _get_predictions_for_horizon(self, current_date: datetime,
-                                     horizon_days: int) -> Tuple[Optional[float], List[float]]:
-        """Get cumulative predicted RV for a given horizon"""
+                                     horizon_days: int) -> Tuple[
+        Optional[float], Optional[float], List[float], List[float]]:
+        """
+        Get cumulative predicted and actual RV for a given horizon
+
+        Returns
+        -------
+        predicted_cum_rv : float or None
+        actual_cum_rv : float or None
+        predicted_rvs : list of floats
+        actual_rvs : list of floats
+        """
         # Collect predictions for this specific date
         predictions_df = self.predictions_lf.collect()
 
@@ -232,7 +241,7 @@ class OptionsBacktesterPolars:
         ).select('quarter')
 
         if len(current_quarter) == 0:
-            return None, []
+            return None, None, [], []
 
         current_quarter = current_quarter['quarter'][0]
 
@@ -245,18 +254,26 @@ class OptionsBacktesterPolars:
         # Find position in quarter
         all_dates = quarter_data['date'].to_list()
         if current_date not in all_dates:
-            return None, []
+            return None, None, [], []
 
         current_idx = all_dates.index(current_date)
 
         # Get predictions ahead
         predictions_ahead = quarter_data['predicted_rv'][current_idx:current_idx + horizon_days]
+        actuals_ahead = quarter_data['actual_rv'][current_idx:current_idx + horizon_days]
 
         if len(predictions_ahead) < horizon_days:
-            return None, []
+            return None, None, [], []
 
-        cumulative_rv = predictions_ahead.sum()
-        return float(cumulative_rv), predictions_ahead.to_list()
+        cumulative_predicted_rv = predictions_ahead.sum()
+        cumulative_actual_rv = actuals_ahead.sum()
+
+        return (
+            float(cumulative_predicted_rv),
+            float(cumulative_actual_rv),
+            predictions_ahead.to_list(),
+            actuals_ahead.to_list()
+        )
 
     def _convert_rv_to_vol(self, cumulative_rv: float, n_days: int) -> float:
         """Convert cumulative RV to annualized volatility"""
@@ -265,8 +282,6 @@ class OptionsBacktesterPolars:
         return annualized_vol
 
     def _get_options_for_date(self, trade_date: datetime, days_to_expiry: int) -> pl.DataFrame:
-        """Get options for specific date and maturity using Polars"""
-        # Filter and collect only what we need
         options = (
             self.options_lf
             .filter(
@@ -289,7 +304,6 @@ class OptionsBacktesterPolars:
         T = horizon_days / 365.0
         r = self._get_risk_free_rate(trade_date)
 
-        # Extract arrays for vectorized computation
         prices = options['mid'].to_numpy()
         strikes = options['strike'].to_numpy()
         option_types = options['option_type'].to_numpy()
@@ -312,13 +326,42 @@ class OptionsBacktesterPolars:
         Signal = predicted_vol - market_iv
         Trade when signal > threshold (volatility is underpriced)
 
-        Returns
-        -------
-        bool : True if should trade long, False otherwise
         """
         signal_strength = predicted_vol - market_iv
         return signal_strength > self.threshold
 
+    def _calculate_position_multiplier(self, signal_strength: float) -> float:
+        """
+        Calculate position multiplier using Option B: Directional Signal Excess
+
+        Scales based on how much signal exceeds threshold in the trading direction.
+        Works naturally with negative thresholds.
+
+        Parameters
+        ----------
+        signal_strength : float
+            predicted_vol - market_iv
+
+        Returns
+        -------
+        float
+            Position multiplier between 0 and signal_multiplier
+        """
+        # Calculate excess signal beyond threshold
+        signal_excess = signal_strength - self.threshold
+
+        # Scale from 0 at threshold to max at (threshold + |threshold|)
+        # This gives 1x at threshold and scales linearly
+        if abs(self.threshold) > 1e-6:  # Avoid division by zero
+            position_multiplier = signal_excess / abs(self.threshold)
+        else:
+            # If threshold is ~0, use a default scaling
+            position_multiplier = abs(signal_excess) / 0.01
+
+        # Clamp between 0 and signal_multiplier
+        position_multiplier = min(max(position_multiplier, 0), self.signal_multiplier)
+
+        return position_multiplier
 
     def _execute_straddle(self, trade_date: datetime, options: pl.DataFrame,
                           predicted_vol: float, signal_strength: float,
@@ -366,8 +409,8 @@ class OptionsBacktesterPolars:
 
         avg_iv = (call_iv + put_iv) / 2.0
 
-        # Position sizing
-        position_multiplier = min(abs(signal_strength) / abs(self.threshold), self.signal_multiplier)
+        # Position sizing with new scaling method
+        position_multiplier = self._calculate_position_multiplier(signal_strength)
         position_size = self.base_position_size * position_multiplier
 
         call_premium = call_option['mid'][0]
@@ -395,6 +438,7 @@ class OptionsBacktesterPolars:
             'total_premium': total_premium,
             'n_contracts': n_contracts,
             'position_size': position_size,
+            'position_multiplier': position_multiplier,
             'predicted_vol': predicted_vol,
             'implied_vol': avg_iv,
             'signal_strength': signal_strength,
@@ -459,8 +503,8 @@ class OptionsBacktesterPolars:
 
         avg_iv = (call_iv + put_iv) / 2.0
 
-        # Position sizing
-        position_multiplier = min(abs(signal_strength) / abs(self.threshold), self.signal_multiplier)
+        # Position sizing with new scaling method
+        position_multiplier = self._calculate_position_multiplier(signal_strength)
         position_size = self.base_position_size * position_multiplier
 
         total_premium = call_premium + put_premium
@@ -484,6 +528,7 @@ class OptionsBacktesterPolars:
             'total_premium': total_premium,
             'n_contracts': n_contracts,
             'position_size': position_size,
+            'position_multiplier': position_multiplier,
             'predicted_vol': predicted_vol,
             'implied_vol': avg_iv,
             'signal_strength': signal_strength,
@@ -562,16 +607,6 @@ class OptionsBacktesterPolars:
         return float(last_prices['active_underlying_price'][0])
 
     def run_backtest(self) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-        """
-        Run the complete backtest
-
-        Returns
-        -------
-        Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]
-            - trades_df: DataFrame with all executed trades
-            - equity_df: DataFrame with portfolio value over time
-            - iv_data_df: DataFrame with predicted vs market IV for all dates
-        """
         print("\n" + "=" * 60)
         print("STARTING BACKTEST - LONG ONLY VOLATILITY STRATEGY")
         print("=" * 60)
@@ -617,12 +652,18 @@ class OptionsBacktesterPolars:
                 print(f"Progress: {idx}/{total_dates} ({idx / total_dates * 100:.1f}%)")
 
             for maturity_name, horizon_days in maturities_to_trade.items():
-                cum_rv, _ = self._get_predictions_for_horizon(trade_date, horizon_days)
+                # Get both predicted and actual RV
+                cum_predicted_rv, cum_actual_rv, pred_list, actual_list = self._get_predictions_for_horizon(
+                    trade_date, horizon_days
+                )
 
-                if cum_rv is None:
+                if cum_predicted_rv is None or cum_actual_rv is None:
                     continue
 
-                predicted_vol = self._convert_rv_to_vol(cum_rv, horizon_days)
+                # Convert both to annualized volatilities
+                predicted_vol = self._convert_rv_to_vol(cum_predicted_rv, horizon_days)
+                actual_vol = self._convert_rv_to_vol(cum_actual_rv, horizon_days)
+
                 options = self._get_options_for_date(trade_date, horizon_days)
 
                 if len(options) == 0:
@@ -647,6 +688,7 @@ class OptionsBacktesterPolars:
                     'maturity': maturity_name,
                     'horizon_days': horizon_days,
                     'predicted_vol': predicted_vol,
+                    'actual_vol': actual_vol,  # NEW: actual realized volatility
                     'market_iv': market_iv,
                     'signal_strength': signal_strength,
                     'threshold': self.threshold,
@@ -658,6 +700,7 @@ class OptionsBacktesterPolars:
                     print(f"\n  Date {idx + 1}: {trade_date.date()}")
                     print(f"    Options found: {len(options)}")
                     print(f"    Predicted vol: {predicted_vol * 100:.2f}%")
+                    print(f"    Actual vol: {actual_vol * 100:.2f}%")
                     print(f"    Market IV: {market_iv * 100:.2f}%")
                     print(f"    Signal: {signal_strength * 100:.2f}%")
                     print(f"    Threshold: {self.threshold * 100:.2f}%")
@@ -673,8 +716,11 @@ class OptionsBacktesterPolars:
                 # Mark that we traded on this day
                 self.iv_data[-1]['traded'] = True
 
+                # Calculate position multiplier for debugging
+                pos_mult = self._calculate_position_multiplier(signal_strength)
+
                 if idx < 3:
-                    print(f"    ✓ Signal triggers LONG trade!")
+                    print(f"    ✓ Signal triggers LONG trade! (Position mult: {pos_mult:.2f}x)")
 
                 # Execute trades
                 if self.strategy_type in ['straddle', 'both']:
